@@ -23,7 +23,10 @@ app.add_middleware(
 cache = cachetools.TTLCache(maxsize=100, ttl=300)
 
 # Abilita cache FastF1
-fastf1.Cache.enable_cache('cache')
+import os
+cache_dir = '/tmp/fastf1_cache'
+os.makedirs(cache_dir, exist_ok=True)
+fastf1.Cache.enable_cache(cache_dir)
 
 @app.on_event("startup")
 async def startup_event():
