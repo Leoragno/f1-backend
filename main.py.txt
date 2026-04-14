@@ -1,0 +1,152 @@
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+import fastf1
+import pandas as pd
+from datetime import datetime
+import cachetools
+import asyncio
+import httpx
+
+app = FastAPI(title="F1 Data API", version="1.0")
+
+# CORS per app mobile
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Cache per evitare chiamate ripetute
+cache = cachetools.TTLCache(maxsize=100, ttl=300)
+
+# Abilita cache FastF1
+fastf1.Cache.enable_cache('cache')
+
+@app.on_event("startup")
+async def startup_event():
+    """Avvia il self-ping per mantenere l'app sveglia"""
+    asyncio.create_task(self_ping())
+    print("✅ FastF1 API avviata!")
+
+async def self_ping():
+    """Ping automatico ogni 4 minuti per evitare sleep"""
+    while True:
+        await asyncio.sleep(240)  # 4 minuti
+        try:
+            async with httpx.AsyncClient() as client:
+                await client.get("https://localhost:8000/keep-alive")
+            print("🔄 Self-ping eseguito")
+        except:
+            pass
+
+@app.get("/")
+async def root():
+    return {"status": "online", "service": "F1 Data API"}
+
+@app.get("/keep-alive")
+async def keep_alive():
+    """Endpoint per mantenere l'app sveglia"""
+    return {"status": "awake"}
+
+@app.get("/api/seasons")
+async def get_seasons():
+    """Restituisce le stagioni disponibili"""
+    return {"seasons": list(range(2018, datetime.now().year + 1))}
+
+@app.get("/api/races/{year}")
+async def get_races(year: int):
+    """Lista tutti i GP di una stagione"""
+    try:
+        schedule = fastf1.get_event_schedule(year)
+        races = schedule[['RoundNumber', 'EventName', 'Country', 'Location', 'EventDate']]
+        return JSONResponse(races.to_dict(orient='records'))
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+@app.get("/api/race-results/{year}/{round}")
+async def get_race_results(year: int, round: int):
+    """Risultati gara completi"""
+    cache_key = f"results_{year}_{round}"
+    
+    if cache_key in cache:
+        return cache[cache_key]
+    
+    try:
+        session = fastf1.get_session(year, round, 'R')
+        session.load()
+        
+        results = session.results[['FullName', 'Position', 'Points', 'TeamName', 'Time']]
+        results['Position'] = results['Position'].astype(str)
+        
+        data = results.to_dict(orient='records')
+        cache[cache_key] = data
+        return JSONResponse(data)
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=f"GP non trovato: {str(e)}")
+
+@app.get("/api/laptimes/{year}/{round}/{driver_abbr}")
+async def get_laptimes(year: int, round: int, driver_abbr: str):
+    """Tempi giro di un pilota"""
+    cache_key = f"laps_{year}_{round}_{driver_abbr}"
+    
+    if cache_key in cache:
+        return cache[cache_key]
+    
+    try:
+        session = fastf1.get_session(year, round, 'R')
+        session.load()
+        
+        laps = session.laps.pick_driver(driver_abbr)
+        
+        if laps.empty:
+            raise HTTPException(404, f"Pilota {driver_abbr} non trovato")
+        
+        lap_data = laps[['LapNumber', 'LapTime', 'Sector1Time', 'Sector2Time', 'Sector3Time']].dropna()
+        lap_data['LapTime_seconds'] = lap_data['LapTime'].dt.total_seconds()
+        
+        result = {
+            "driver": driver_abbr,
+            "total_laps": len(lap_data),
+            "best_lap": float(lap_data['LapTime_seconds'].min()),
+            "laps": lap_data[['LapNumber', 'LapTime_seconds']].to_dict(orient='records')
+        }
+        
+        cache[cache_key] = result
+        return JSONResponse(result)
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+@app.get("/api/telemetry/{year}/{round}/{driver_abbr}/{lap_number}")
+async def get_telemetry(year: int, round: int, driver_abbr: str, lap_number: int):
+    """Telemetria dettagliata di un giro"""
+    cache_key = f"tele_{year}_{round}_{driver_abbr}_{lap_number}"
+    
+    if cache_key in cache:
+        return cache[cache_key]
+    
+    try:
+        session = fastf1.get_session(year, round, 'R')
+        session.load()
+        
+        lap = session.laps.pick_driver(driver_abbr).pick_lap(lap_number)
+        if lap.empty:
+            raise HTTPException(404, "Giro non trovato")
+        
+        telemetry = lap.get_car_data()
+        
+        data = {
+            "distance": telemetry['Distance'].tolist(),
+            "speed": telemetry['Speed'].tolist(),
+            "throttle": telemetry['Throttle'].tolist(),
+            "brake": telemetry['Brake'].tolist(),
+            "gear": telemetry['nGear'].tolist(),
+            "rpm": telemetry['RPM'].tolist()
+        }
+        
+        cache[cache_key] = data
+        return JSONResponse(data)
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=str(e))
